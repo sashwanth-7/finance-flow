@@ -1,0 +1,263 @@
+// This is your Prisma schema file
+// Database: SQLite for dev, PostgreSQL for prod
+
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "debian-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Company {
+  id           String     @id @default(uuid())
+  name         String
+  code         String     @unique
+  ownerName    String?
+  phone        String?
+  address      String?
+  isActive     Boolean    @default(true)
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  users        User[]
+  customers    Customer[]
+  loans        Loan[]
+  expenses     Expense[]
+
+  @@index([code])
+}
+
+model User {
+  id           String     @id @default(uuid())
+  companyId    String?
+  company      Company?   @relation(fields: [companyId], references: [id], onDelete: SetNull)
+  agentId      String?
+  name         String
+  email        String
+  phone        String
+  passwordHash String
+  role         String     @default("CUSTOMER") // SUPER_ADMIN | ADMIN | AGENT | CUSTOMER
+  isActive     Boolean    @default(true)
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  // Relations
+  customers    Customer[]
+  agentLoans   Loan[]     @relation("AgentLoans")
+  payments     Payment[]  @relation("CollectedBy")
+  auditLogs    AuditLog[]
+  refreshTokens RefreshToken[]
+
+  @@index([email])
+  @@index([phone])
+  @@index([companyId])
+}
+
+model RefreshToken {
+  id        String   @id @default(uuid())
+  token     String   @unique
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+}
+
+model Customer {
+  id          String    @id @default(uuid())
+  companyId   String?
+  company     Company?  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  userId      String
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name        String
+  phone       String
+  email       String?
+  address     String
+  city        String
+  idType      String   // AADHAR | PAN | VOTER | DRIVING
+  idNumber    String
+  idProofUrl  String?
+  photoUrl    String?
+  isActive    Boolean   @default(true)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  notificationPref String @default("BOTH") // WHATSAPP | APP | BOTH | NONE
+  latitude   Float?   // GPS latitude for map pinning
+  longitude  Float?   // GPS longitude for map pinning
+
+  // Jamin (Guarantor) details
+  jaminName         String?
+  jaminPhone        String?
+  jaminAddress      String?
+  jaminRelationship String?
+  jaminIdType       String?
+  jaminIdNumber     String?
+  jaminPhotoUrl     String?
+  jaminIdProofUrl   String?
+
+  loans       Loan[]
+  notificationLogs NotificationLog[]
+
+  @@index([phone])
+  @@index([name])
+  @@index([idNumber])
+  @@index([companyId])
+}
+
+model Loan {
+  id                String    @id @default(uuid())
+  companyId         String?
+  company           Company?  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  loanNumber        String
+  customerId        String
+  customer          Customer  @relation(fields: [customerId], references: [id])
+  agentId           String?
+  agent             User?     @relation("AgentLoans", fields: [agentId], references: [id])
+  
+  // Financial details
+  principalAmount   Float
+  interestRate      Float    // Annual rate in %
+  interestType      String   // FLAT | REDUCING
+  tenure            Int      // Number of units
+  tenureUnit        String   // DAYS | WEEKS | MONTHS
+  processingFee     Float    @default(0)
+  
+  // Calculated fields
+  totalInterest     Float
+  totalPayable      Float
+  installmentAmount Float
+  
+  // Tracking fields - interest collected separately from principal
+  interestCollected Float    @default(0)  // Total interest collected via weekly payments
+  outstandingPrincipal Float?              // Remaining principal (null means same as principalAmount)
+  
+  // Status
+  status            String   @default("ACTIVE") // ACTIVE | CLOSED | DEFAULTED | PENDING
+  disbursedAt       DateTime?
+  startDate         DateTime
+  endDate           DateTime
+  
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  repayments        Repayment[]
+
+  @@unique([companyId, loanNumber])
+  @@index([customerId])
+  @@index([status])
+  @@index([createdAt, interestType])
+  @@index([status, companyId])
+  @@index([loanNumber])
+  @@index([companyId])
+}
+
+model Repayment {
+  id            String   @id @default(uuid())
+  loanId        String
+  loan          Loan     @relation(fields: [loanId], references: [id])
+  installmentNo Int
+  dueDate       DateTime
+  dueAmount     Float
+  principal     Float
+  interest      Float
+  
+  // Weekly & Daily schedule tracking
+  weekNo        Int?     // e.g. Week 1, Week 2...
+  dayNo         Int?     // e.g. Day 1 to Day 7 for daily frequency
+  
+  // Overdue Penalty & Carry Forward
+  penaltyAmount Float    @default(0)
+  penaltyPaid   Float    @default(0)
+  penaltyStatus String   @default("NONE") // NONE | PENDING | PAID
+  originalDueDate DateTime? // Preserves original scheduled due date
+  carriedToInstNo Int?     // Installment number this was carried forward to
+  
+  // Payment
+  paidAmount    Float    @default(0)
+  paidAt        DateTime?
+  status        String   @default("PENDING") // PENDING | PAID | OVERDUE | PARTIAL | CARRIED_FORWARD
+  
+  payments      Payment[]
+  notificationLogs NotificationLog[]
+
+  @@index([loanId])
+  @@index([dueDate])
+  @@index([status])
+  @@index([weekNo])
+  @@index([dueDate, status])
+}
+
+model Payment {
+  id            String   @id @default(uuid())
+  repaymentId   String
+  repayment     Repayment @relation(fields: [repaymentId], references: [id])
+  collectedById String
+  collectedBy   User     @relation("CollectedBy", fields: [collectedById], references: [id])
+  amount        Float
+  paymentMode   String   @default("CASH") // CASH | UPI | BANK | CHEQUE
+  paymentType   String   @default("INTEREST") // INTEREST | PRINCIPAL
+  reference     String?
+  notes         String?
+  collectedAt   DateTime @default(now())
+
+  @@index([repaymentId])
+  @@index([collectedAt])
+  @@index([collectedAt, paymentType])
+}
+
+model AuditLog {
+  id         String   @id @default(uuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id])
+  action     String
+  entity     String
+  entityId   String?
+  details    String?  // JSON string
+  ipAddress  String?
+  userAgent  String?
+  createdAt  DateTime @default(now())
+
+  @@index([userId])
+  @@index([entity])
+  @@index([createdAt])
+}
+
+model ReminderSetting {
+  id            String   @id @default("default")
+  enabled       Boolean  @default(true)
+  daysBeforeDue String   @default("[0, 1]") // JSON array, 0 = same day
+  updatedAt     DateTime @updatedAt
+}
+
+model NotificationLog {
+  id          String    @id @default(uuid())
+  repaymentId String
+  repayment   Repayment @relation(fields: [repaymentId], references: [id])
+  customerId  String
+  customer    Customer  @relation(fields: [customerId], references: [id])
+  type        String    // WHATSAPP | APP
+  status      String    @default("PENDING") // PENDING | SENT | FAILED
+  message     String
+  readAt      DateTime? // For APP notifications
+  createdAt   DateTime  @default(now())
+  
+  @@index([customerId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model Expense {
+  id          String    @id @default(uuid())
+  companyId   String?
+  company     Company?  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  amount      Float
+  category    String    @default("OFFICE")
+  description String?
+  date        DateTime  @default(now())
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([companyId])
+}

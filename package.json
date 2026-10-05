@@ -1,0 +1,10 @@
+{
+  "name": "finance-app-root",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Finance App Root Launcher",
+  "scripts": {
+    "start": "node start.js",
+    "dev": "node start.js"
+  }
+}

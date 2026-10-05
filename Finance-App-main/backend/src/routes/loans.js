@@ -1,0 +1,660 @@
+const express = require('express');
+const router = express.Router();
+const { PrismaClient } = require('@prisma/client');
+const { authenticate, authorize } = require('../middleware/auth');
+const { auditLog } = require('../utils/audit');
+const { invalidateDashboardCache } = require('./dashboard');
+const { generateLoanNumber, syncOverdueStatus } = require('../utils/loanCalc');
+const prisma = new PrismaClient();
+
+const round2 = (n) => Math.round(n * 100) / 100;
+
+/**
+ * Get the initial batch size for a tenure unit.
+ * This is how many installments we generate at a time.
+ */
+function getBatchSize(tenureUnit) {
+  if (tenureUnit === 'WEEKS') return 52;
+  if (tenureUnit === 'MONTHS') return 12;
+  return 365; // DAYS
+}
+
+/**
+ * Generate installment records with weekly/daily schedule metadata.
+ * @param {string} loanId
+ * @param {number} principalPerPeriod
+ * @param {number} interestPerPeriod
+ * @param {string} tenureUnit - WEEKS | MONTHS | DAYS
+ * @param {Date} startFrom - starting date
+ * @param {number} startNo - starting installment number
+ * @param {number} count - number of installments
+ * @param {string} frequency - DAILY | WEEKLY | MONTHLY
+ */
+function generateInstallments(loanId, principalPerPeriod, interestPerPeriod, tenureUnit, startFrom, startNo, count, frequency = null) {
+  const installments = [];
+  const isDaily = frequency === 'DAILY' || tenureUnit === 'DAYS';
+  const isWeekly = frequency === 'WEEKLY' || tenureUnit === 'WEEKS';
+  const isMonthly = frequency === 'MONTHLY' || tenureUnit === 'MONTHS';
+
+  for (let i = 0; i < count; i++) {
+    const dueDate = new Date(startFrom);
+    const offset = (startNo === 1) ? i : (i + 1);
+
+    let weekNo, dayNo;
+    if (isDaily) {
+      dueDate.setDate(dueDate.getDate() + offset);
+      const absIndex = (startNo - 1) + i;
+      weekNo = Math.floor(absIndex / 7) + 1;
+      dayNo = (absIndex % 7) + 1;
+    } else if (isWeekly) {
+      dueDate.setDate(dueDate.getDate() + offset * 7);
+      weekNo = (startNo - 1) + i + 1;
+      dayNo = null;
+    } else {
+      dueDate.setMonth(dueDate.getMonth() + offset);
+      weekNo = (startNo - 1) + i + 1;
+      dayNo = null;
+    }
+
+    let prin = round2(principalPerPeriod);
+    let intst = round2(interestPerPeriod);
+    let due = round2(prin + intst);
+
+    installments.push({
+      loanId,
+      installmentNo: startNo + i,
+      weekNo,
+      dayNo,
+      dueDate,
+      originalDueDate: dueDate,
+      dueAmount: due,
+      principal: prin,
+      interest: intst,
+      penaltyAmount: 0,
+      penaltyPaid: 0,
+      penaltyStatus: 'NONE',
+      status: 'PENDING',
+    });
+  }
+  return installments;
+}
+
+/**
+ * Auto-extend a loan's installments if most existing ones are paid/used.
+ * Generates another batch when unpaid installments fall below a threshold.
+ */
+async function autoExtendIfNeeded(loanId) {
+  const loan = await prisma.loan.findUnique({ where: { id: loanId } });
+  if (!loan || loan.status !== 'ACTIVE') return;
+  if (loan.interestType === 'WITHOUT_INTEREST' || loan.interestType === 'EMI') return; // Fixed tenure, no auto-extend
+
+  // Count unpaid installments
+  const unpaidCount = await prisma.repayment.count({
+    where: { loanId, status: { in: ['PENDING', 'OVERDUE', 'PARTIAL'] } },
+  });
+
+  // Threshold: extend when fewer than 4 unpaid installments remain
+  const threshold = 4;
+  if (unpaidCount >= threshold) return;
+
+  // Get the last installment to know where to continue from
+  const lastInstallment = await prisma.repayment.findFirst({
+    where: { loanId },
+    orderBy: { installmentNo: 'desc' },
+  });
+
+  if (!lastInstallment) return;
+
+  const interestPerPeriod = loan.principalAmount * (loan.interestRate / 100);
+  const batchSize = getBatchSize(loan.tenureUnit);
+  const startNo = lastInstallment.installmentNo + 1;
+  const startFrom = new Date(lastInstallment.dueDate);
+
+  const newInstallments = generateInstallments(
+    loanId, 0, interestPerPeriod, loan.tenureUnit, startFrom, startNo, batchSize
+  );
+
+  await prisma.repayment.createMany({ data: newInstallments });
+
+  // Update loan tenure count and end date
+  const newEndDate = newInstallments[newInstallments.length - 1].dueDate;
+  await prisma.loan.update({
+    where: { id: loanId },
+    data: {
+      tenure: startNo + batchSize - 1,
+      endDate: newEndDate,
+      totalInterest: round2(interestPerPeriod * (startNo + batchSize - 1)),
+      totalPayable: round2(loan.principalAmount + interestPerPeriod * (startNo + batchSize - 1)),
+    },
+  });
+}
+
+// GET /api/loans
+router.get('/', authenticate, async (req, res) => {
+  try {
+    const { status, customerId, agentId, search, tenureUnit, page = 1, limit = 20 } = req.query;
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const where = {};
+
+    // Multi-tenant isolation: filter strictly by companyId
+    if (req.user.companyId) {
+      where.companyId = req.user.companyId;
+    }
+
+    if (status) where.status = status;
+    if (customerId) where.customerId = customerId;
+    if (agentId) where.agentId = agentId;
+    if (tenureUnit) where.tenureUnit = tenureUnit;
+    
+    if (search) {
+      where.OR = [
+        { loanNumber: { contains: search, mode: 'insensitive' } },
+        { customer: { name: { contains: search, mode: 'insensitive' } } },
+        { customer: { phone: { contains: search, mode: 'insensitive' } } },
+      ];
+    }
+    
+    // if (req.user.role === 'AGENT') where.agentId = req.user.id; // Removed so all agents see all loans
+    if (req.user.role === 'CUSTOMER') {
+      const customer = await prisma.customer.findUnique({ where: { userId: req.user.id } });
+      if (customer) where.customerId = customer.id;
+    }
+
+    const [loans, total] = await Promise.all([
+      prisma.loan.findMany({
+        where,
+        skip,
+        take: parseInt(limit),
+        include: {
+          customer: { select: { id: true, name: true, phone: true } },
+          agent: { select: { id: true, name: true } },
+          repayments: {
+            select: { id: true, status: true, dueAmount: true, paidAmount: true },
+          },
+        },
+        orderBy: { createdAt: 'desc' },
+      }),
+      prisma.loan.count({ where }),
+    ]);
+
+    res.json({ success: true, data: loans, meta: { total, page: parseInt(page), limit: parseInt(limit) } });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// GET /api/loans/:id/preclosure
+router.get('/:id/preclosure', authenticate, async (req, res) => {
+  try {
+    const loan = await prisma.loan.findUnique({
+      where: { id: req.params.id },
+      include: { repayments: { include: { payments: true } } }
+    });
+    if (!loan) return res.status(404).json({ success: false, message: 'Loan not found' });
+    if (req.user.companyId && loan.companyId && loan.companyId !== req.user.companyId) {
+      return res.status(403).json({ success: false, message: 'Access denied to this loan' });
+    }
+    if (loan.status === 'CLOSED') return res.status(400).json({ success: false, message: 'Loan is already closed' });
+
+    let principalOutstanding = loan.outstandingPrincipal ?? loan.principalAmount;
+    let accruedInterest = 0;
+    let unpaidPeriods = 0;
+    let tenureUnitStr = loan.tenureUnit === 'MONTHS' ? 'Months' : loan.tenureUnit === 'WEEKS' ? 'Weeks' : 'Days';
+
+    if (loan.interestType === 'FLAT') {
+      const today = new Date();
+      today.setHours(23, 59, 59, 999);
+      const start = new Date(loan.startDate);
+      
+      const diffTime = Math.max(0, today - start);
+      const diffDays = Math.floor(diffTime / (1000 * 60 * 60 * 24));
+      
+      // Calculate daily interest rate
+      let dailyInterest = 0;
+      const rate = loan.interestRate / 100;
+      if (loan.tenureUnit === 'MONTHS') dailyInterest = (loan.principalAmount * rate) / 30;
+      else if (loan.tenureUnit === 'WEEKS') dailyInterest = (loan.principalAmount * rate) / 7;
+      else dailyInterest = (loan.principalAmount * rate);
+
+      const totalAccrued = dailyInterest * diffDays;
+      
+      // Total interest paid so far
+      const totalInterestPaid = loan.repayments.reduce((acc, r) => {
+        const intPayments = r.payments.filter(p => p.paymentType === 'INTEREST').reduce((s, p) => s + p.amount, 0);
+        return acc + intPayments;
+      }, 0);
+
+      accruedInterest = Math.max(0, Math.round(totalAccrued - totalInterestPaid));
+      
+      const interestPerPeriod = loan.principalAmount * rate;
+      if (interestPerPeriod > 0) {
+        unpaidPeriods = (accruedInterest / interestPerPeriod).toFixed(1);
+      }
+    } else if (loan.interestType === 'EMI') {
+      // For EMI, interest is already fixed. Preclosure could optionally waive future interest, but usually they pay the full remaining.
+      // For simplicity, we just use the remaining unpaid interest.
+      const paid = loan.repayments.reduce((acc, r) => acc + (r.paidAmount || 0), 0);
+      const totalRemaining = Math.max(0, (loan.totalPayable || loan.principalAmount) - paid);
+      accruedInterest = Math.max(0, totalRemaining - principalOutstanding);
+    } else {
+      // WITHOUT_INTEREST
+      accruedInterest = 0;
+    }
+
+    res.json({ success: true, data: { principalOutstanding, accruedInterest, unpaidPeriods, tenureUnitStr } });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// GET /api/loans/:id
+router.get('/:id', authenticate, async (req, res) => {
+  try {
+    // Auto-sync overdue statuses and penalty amounts
+    await syncOverdueStatus(prisma);
+
+    // Auto-extend installments if running low (before fetching)
+    await autoExtendIfNeeded(req.params.id);
+
+    const loan = await prisma.loan.findUnique({
+      where: { id: req.params.id },
+      include: {
+        customer: true,
+        agent: { select: { id: true, name: true, phone: true } },
+        repayments: {
+          include: { payments: { include: { collectedBy: { select: { id: true, name: true } } } } },
+          orderBy: { installmentNo: 'asc' },
+        },
+      },
+    });
+    if (!loan) return res.status(404).json({ success: false, message: 'Loan not found' });
+    if (req.user.companyId && loan.companyId && loan.companyId !== req.user.companyId) {
+      return res.status(403).json({ success: false, message: 'Access denied to this loan' });
+    }
+
+    // Aggregate penalty for this specific loan
+    const penaltyAgg = await prisma.payment.aggregate({
+      where: {
+        paymentType: 'PENALTY',
+        repayment: { loanId: req.params.id },
+      },
+      _sum: { amount: true },
+      _count: true,
+    });
+    const repPenaltySum = (loan.repayments || []).reduce((sum, r) => sum + (r.penaltyPaid || 0), 0);
+    const loanPenaltyCollected = Math.max(penaltyAgg._sum.amount || 0, repPenaltySum);
+
+    res.json({
+      success: true,
+      data: {
+        ...loan,
+        penaltyCollected: loanPenaltyCollected,
+        penaltyCount: penaltyAgg._count || 0,
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// POST /api/loans — Create loan
+router.post('/', authenticate, authorize('ADMIN', 'AGENT'), async (req, res) => {
+  try {
+    const {
+      customerId, agentId, principalAmount, interestRate,
+      interestType = 'FLAT', tenure, tenureUnit = 'MONTHS',
+      processingFee = 0, advanceDeduction, repaymentFrequency, startDate, alreadyCollectedAmount = 0,
+    } = req.body;
+
+    if (!customerId || !principalAmount || interestRate === undefined || !startDate) {
+      return res.status(400).json({ success: false, message: 'Missing required loan fields' });
+    }
+
+    // Verify customer exists and belongs to user's company
+    const customer = await prisma.customer.findUnique({
+      where: { id: customerId },
+      select: { id: true, companyId: true }
+    });
+    if (!customer) {
+      return res.status(404).json({ success: false, message: 'Customer not found' });
+    }
+    if (req.user.companyId && customer.companyId && customer.companyId !== req.user.companyId) {
+      return res.status(403).json({ success: false, message: 'Customer belongs to a different finance company' });
+    }
+    const effectiveCompanyId = req.user.companyId || customer.companyId || null;
+
+    const start = new Date(startDate);
+    const fee = parseFloat(advanceDeduction || processingFee || 0);
+    
+    let batchSize, interestPerPeriod, principalPerPeriod, installmentAmount, totalPayable, totalInterest;
+    let frequency = repaymentFrequency || (tenureUnit === 'DAYS' ? 'DAILY' : tenureUnit === 'WEEKS' ? 'WEEKLY' : 'MONTHLY');
+      if (interestType === 'FLAT' || interestType === 'EMI') {
+        frequency = tenureUnit === 'DAYS' ? 'DAILY' : tenureUnit === 'WEEKS' ? 'WEEKLY' : 'MONTHLY';
+        if (interestType === 'FLAT' && frequency === 'DAILY') {
+          frequency = 'MONTHLY';
+          tenureUnit = 'MONTHS';
+        }
+      }
+
+    if (interestType === 'WITHOUT_INTEREST') {
+      const isDaily = frequency === 'DAILY' || tenureUnit === 'DAYS';
+      const isWeekly = frequency === 'WEEKLY' || tenureUnit === 'WEEKS';
+      const isMonthly = frequency === 'MONTHLY' || tenureUnit === 'MONTHS';
+      const weeksOrDays = tenure ? parseInt(tenure) : (isDaily ? (tenureUnit === 'DAYS' ? 100 : 10) : 10);
+      
+      // If daily frequency with WEEKS unit, 10 weeks = 70 daily installments
+      // If daily with DAYS unit, weeksOrDays daily installments
+      // If weekly or monthly, weeksOrDays installments
+      batchSize = isDaily ? (tenureUnit === 'DAYS' ? weeksOrDays : weeksOrDays * 7) : weeksOrDays;
+      interestPerPeriod = 0;
+      principalPerPeriod = parseFloat(principalAmount) / batchSize;
+      installmentAmount = principalPerPeriod;
+      totalPayable = parseFloat(principalAmount);
+      totalInterest = 0;
+    } else if (interestType === 'EMI') {
+      batchSize = tenure ? parseInt(tenure) : getBatchSize(tenureUnit);
+      const r_per_period = parseFloat(interestRate);
+      
+      interestPerPeriod = batchSize > 0 ? parseFloat(principalAmount) * (r_per_period / 100) : 0;
+      principalPerPeriod = batchSize > 0 ? parseFloat(principalAmount) / batchSize : 0;
+      installmentAmount = interestPerPeriod + principalPerPeriod;
+      
+      totalInterest = interestPerPeriod * batchSize;
+      totalPayable = parseFloat(principalAmount) + totalInterest;
+    } else {
+      batchSize = getBatchSize(tenureUnit);
+      interestPerPeriod = parseFloat(principalAmount) * (parseFloat(interestRate) / 100);
+      principalPerPeriod = 0;
+      installmentAmount = interestPerPeriod;
+      totalPayable = parseFloat(principalAmount) + (interestPerPeriod * batchSize);
+      totalInterest = interestPerPeriod * batchSize;
+    }
+
+    const calc = {
+      totalInterest: round2(totalInterest),
+      totalPayable: round2(totalPayable),
+      installmentAmount: round2(installmentAmount),
+    };
+
+    // End date calculation
+    const end = new Date(start);
+    if (frequency === 'DAILY' || tenureUnit === 'DAYS') end.setDate(end.getDate() + batchSize);
+    else if (frequency === 'MONTHLY' || tenureUnit === 'MONTHS') end.setMonth(end.getMonth() + batchSize);
+    else if (frequency === 'WEEKLY' || tenureUnit === 'WEEKS') end.setDate(end.getDate() + batchSize * 7);
+    else end.setDate(end.getDate() + batchSize);
+
+    // Generate sequential loan number strictly scoped to this company
+    const companyLoanWhere = effectiveCompanyId ? { companyId: effectiveCompanyId } : {};
+    const companyLoans = await prisma.loan.findMany({
+      where: companyLoanWhere,
+      select: { loanNumber: true },
+    });
+    let maxSeq = 0;
+    const existingLoanNumbers = new Set();
+    for (const l of companyLoans) {
+      if (l.loanNumber) {
+        existingLoanNumbers.add(l.loanNumber);
+        if (l.loanNumber.startsWith('LN-')) {
+          const num = parseInt(l.loanNumber.replace(/^LN-0*/, ''), 10);
+          if (!isNaN(num) && num > maxSeq) {
+            maxSeq = num;
+          }
+        }
+      }
+    }
+    let nextSeq = maxSeq + 1;
+    let loanNumber = `LN-${String(nextSeq).padStart(4, '0')}`;
+    while (existingLoanNumbers.has(loanNumber)) {
+      nextSeq += 1;
+      loanNumber = `LN-${String(nextSeq).padStart(4, '0')}`;
+    }
+
+    const loan = await prisma.loan.create({
+      data: {
+        loanNumber,
+        customerId,
+        companyId: effectiveCompanyId,
+        agentId: agentId || req.user.id,
+        principalAmount: parseFloat(principalAmount),
+        interestRate: parseFloat(interestRate),
+        interestType,
+        tenure: batchSize,
+        tenureUnit,
+        processingFee: fee,
+        ...calc,
+        interestCollected: 0,
+        outstandingPrincipal: parseFloat(principalAmount),
+        status: 'ACTIVE',
+        disbursedAt: new Date(),
+        startDate: start,
+        endDate: end,
+      },
+    });
+
+    // Generate initial installment batch
+    const installments = generateInstallments(
+      loan.id, principalPerPeriod, interestPerPeriod, tenureUnit, start, 1, batchSize, frequency
+    );
+    await prisma.repayment.createMany({ data: installments });
+
+    // Handle Pre-collected Amount (alreadyCollectedAmount)
+    let remainingCollected = parseFloat(alreadyCollectedAmount);
+    if (remainingCollected > 0) {
+      const createdReps = await prisma.repayment.findMany({
+        where: { loanId: loan.id },
+        orderBy: { installmentNo: 'asc' }
+      });
+      let totalInterestPaid = 0;
+      
+      for (const rep of createdReps) {
+        if (remainingCollected <= 0) break;
+        const pendingAmount = rep.dueAmount - rep.paidAmount;
+        const toPay = Math.min(pendingAmount, remainingCollected);
+        
+        if (toPay > 0) {
+          const newPaidAmount = rep.paidAmount + toPay;
+          const status = newPaidAmount >= rep.dueAmount ? 'PAID' : 'PARTIAL';
+          
+          await prisma.repayment.update({
+            where: { id: rep.id },
+            data: { paidAmount: newPaidAmount, paidAt: new Date(), status }
+          });
+          
+          await prisma.payment.create({
+            data: {
+              repaymentId: rep.id,
+              collectedById: loan.agentId,
+              amount: toPay,
+              paymentMode: 'CASH',
+              paymentType: (rep.principal > 0 && rep.interest > 0) ? 'EMI' : (rep.principal > 0 ? 'PRINCIPAL' : 'INTEREST'),
+              reference: 'Pre-collected Entry',
+              collectedAt: new Date()
+            }
+          });
+          remainingCollected -= toPay;
+          totalInterestPaid += toPay;
+        }
+      }
+      
+      if (totalInterestPaid > 0) {
+        if (loan.interestType === 'WITHOUT_INTEREST' || loan.interestType === 'EMI') {
+          await prisma.loan.update({
+            where: { id: loan.id },
+            data: { outstandingPrincipal: { decrement: totalInterestPaid } }
+          });
+        } else {
+          await prisma.loan.update({
+            where: { id: loan.id },
+            data: { interestCollected: { increment: totalInterestPaid } }
+          });
+        }
+      }
+    }
+
+    await auditLog(req.user.id, 'CREATE_LOAN', 'Loan', loan.id, { loanNumber, principalAmount, continuous: true, alreadyCollectedAmount }, req);
+
+    const fullLoan = await prisma.loan.findUnique({
+      where: { id: loan.id },
+      include: { customer: true, repayments: { orderBy: { installmentNo: 'asc' } } },
+    });
+
+    if (typeof invalidateDashboardCache === 'function') {
+      invalidateDashboardCache(fullLoan?.companyId || req.user.companyId);
+    }
+    res.status(201).json({ success: true, data: fullLoan });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// PATCH /api/loans/:id/status
+router.patch('/:id/status', authenticate, authorize('ADMIN'), async (req, res) => {
+  try {
+    const { status } = req.body;
+    const loan = await prisma.loan.update({ where: { id: req.params.id }, data: { status } });
+    await auditLog(req.user.id, 'UPDATE_LOAN_STATUS', 'Loan', loan.id, { status }, req);
+    if (typeof invalidateDashboardCache === 'function') {
+      invalidateDashboardCache(loan?.companyId || req.user.companyId);
+    }
+    res.json({ success: true, data: loan });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// DELETE /api/loans/:id
+router.delete('/:id', authenticate, authorize('ADMIN'), async (req, res) => {
+  try {
+    const loanId = req.params.id;
+    const loan = await prisma.loan.findUnique({ where: { id: loanId } });
+    if (!loan) return res.status(404).json({ success: false, message: 'Loan not found' });
+    if (req.user.companyId && loan.companyId && loan.companyId !== req.user.companyId) {
+      return res.status(403).json({ success: false, message: 'Access denied to this loan' });
+    }
+
+    // Cascade delete manually
+    const repayments = await prisma.repayment.findMany({ where: { loanId }, select: { id: true } });
+    const repaymentIds = repayments.map(r => r.id);
+
+    if (repaymentIds.length > 0) {
+      await prisma.notificationLog.deleteMany({ where: { repaymentId: { in: repaymentIds } } });
+      await prisma.payment.deleteMany({ where: { repaymentId: { in: repaymentIds } } });
+      await prisma.repayment.deleteMany({ where: { id: { in: repaymentIds } } });
+    }
+    
+    await prisma.loan.delete({ where: { id: loanId } });
+    await auditLog(req.user.id, 'DELETE_LOAN', 'Loan', loanId, { loanNumber: loan.loanNumber }, req);
+
+    if (typeof invalidateDashboardCache === 'function') {
+      invalidateDashboardCache(loan?.companyId || req.user.companyId);
+    }
+
+    res.json({ success: true, message: 'Loan permanently deleted' });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// GET /api/loans/:id/report — Download CSV report of the full loan history
+router.get('/:id/report', authenticate, async (req, res) => {
+  try {
+    const loan = await prisma.loan.findUnique({
+      where: { id: req.params.id },
+      include: {
+        customer: true,
+        agent: { select: { name: true, phone: true } },
+        repayments: {
+          include: {
+            payments: {
+              include: { collectedBy: { select: { name: true } } },
+              orderBy: { collectedAt: 'asc' },
+            },
+          },
+          orderBy: { installmentNo: 'asc' },
+        },
+      },
+    });
+
+    if (!loan) return res.status(404).json({ success: false, message: 'Loan not found' });
+
+    const formatDate = (d) => d ? new Date(d).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }) : '-';
+    const formatDateTime = (d) => d ? new Date(d).toLocaleString('en-IN', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }) : '-';
+
+    // Build CSV content
+    let csv = '';
+
+    // ─── Section 1: Loan Summary ───
+    csv += 'LOAN REPORT\r\n';
+    csv += `Generated On,"${formatDateTime(new Date())}"\r\n`;
+    csv += '\r\n';
+    csv += 'LOAN DETAILS\r\n';
+    csv += `Loan Number,"${loan.loanNumber}"\r\n`;
+    csv += `Status,"${loan.status}"\r\n`;
+    csv += `Customer Name,"${loan.customer?.name}"\r\n`;
+    csv += `Customer Phone,"${loan.customer?.phone}"\r\n`;
+    csv += `Customer Address,"${loan.customer?.address || 'N/A'}"\r\n`;
+    csv += `Agent,"${loan.agent?.name || 'N/A'}"\r\n`;
+    csv += `Principal Amount,"${loan.principalAmount}"\r\n`;
+    csv += `Outstanding Principal,"${loan.outstandingPrincipal ?? loan.principalAmount}"\r\n`;
+    csv += `Interest Rate,"${loan.interestRate}% per ${loan.tenureUnit === 'WEEKS' ? 'week' : loan.tenureUnit === 'MONTHS' ? 'month' : 'day'}"\r\n`;
+    csv += `Installment Amount,"${loan.installmentAmount}"\r\n`;
+    csv += `Collection Frequency,"${loan.tenureUnit === 'WEEKS' ? 'Weekly' : loan.tenureUnit === 'MONTHS' ? 'Monthly' : 'Daily'}"\r\n`;
+    csv += `Total Interest Collected,"${loan.interestCollected || 0}"\r\n`;
+    csv += `Start Date,"${formatDate(loan.startDate)}"\r\n`;
+    csv += `Created On,"${formatDate(loan.createdAt)}"\r\n`;
+    csv += '\r\n';
+
+    // ─── Section 2: Interest Collection Schedule ───
+    csv += 'INTEREST COLLECTION SCHEDULE\r\n';
+    csv += 'Installment #,Due Date,Interest Due,Paid Amount,Status,Paid On,Collected By,Payment Mode,Reference\r\n';
+
+    // Only include repayments that are PAID or have some activity
+    const paidRepayments = loan.repayments.filter(r => r.status === 'PAID' || r.paidAmount > 0);
+
+    for (const r of paidRepayments) {
+      if (r.payments && r.payments.length > 0) {
+        for (const p of r.payments) {
+          if (p.paymentType === 'PRINCIPAL') continue; // Skip principal payments here
+          csv += `${r.installmentNo},"${formatDate(r.dueDate)}",${r.dueAmount},${p.amount},${r.status},"${formatDateTime(p.collectedAt)}","${p.collectedBy?.name || 'N/A'}",${p.paymentMode || 'CASH'},"${p.reference || ''}"\r\n`;
+        }
+      } else {
+        csv += `${r.installmentNo},"${formatDate(r.dueDate)}",${r.dueAmount},${r.paidAmount},${r.status},"${formatDate(r.paidAt)}","-","-","-"\r\n`;
+      }
+    }
+    csv += '\r\n';
+
+    // ─── Section 3: Principal Payments ───
+    const principalPayments = loan.repayments
+      .flatMap(r => (r.payments || []).filter(p => p.paymentType === 'PRINCIPAL'));
+
+    if (principalPayments.length > 0) {
+      csv += 'PRINCIPAL PAYMENTS\r\n';
+      csv += 'Date,Amount,Payment Mode,Reference,Collected By,Notes\r\n';
+      for (const p of principalPayments) {
+        csv += `"${formatDateTime(p.collectedAt)}",${p.amount},${p.paymentMode || 'CASH'},"${p.reference || ''}","${p.collectedBy?.name || 'N/A'}","${p.notes || ''}"\r\n`;
+      }
+      csv += '\r\n';
+    }
+
+    // ─── Section 4: Summary ───
+    const totalInterestPaid = paidRepayments.reduce((sum, r) => sum + (r.paidAmount || 0), 0);
+    const totalPrincipalPaid = principalPayments.reduce((sum, p) => sum + p.amount, 0);
+    csv += 'SUMMARY\r\n';
+    csv += `Total Interest Payments,"${paidRepayments.length}"\r\n`;
+    csv += `Total Interest Collected,"${round2(totalInterestPaid)}"\r\n`;
+    csv += `Total Principal Paid,"${round2(totalPrincipalPaid)}"\r\n`;
+    csv += `Grand Total Received,"${round2(totalInterestPaid + totalPrincipalPaid)}"\r\n`;
+    csv += `Outstanding Principal,"${loan.outstandingPrincipal ?? loan.principalAmount}"\r\n`;
+    csv += `Loan Status,"${loan.status}"\r\n`;
+
+    // Send as downloadable CSV
+    const filename = `Loan_${loan.loanNumber}_Report_${new Date().toISOString().split('T')[0]}.csv`;
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.send(csv);
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+module.exports = router;
